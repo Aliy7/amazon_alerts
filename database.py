@@ -1,10 +1,11 @@
 
-import sqlite3, hashlib
+import sqlite3
 import bcrypt
+import secrets
 
 from pathlib import Path
-from typing import List, Dict
-from datetime import datetime
+from typing import List, Dict, Optional
+from datetime import datetime, timedelta
 
 database_path = Path(__file__).with_name("jobs.db")
 
@@ -137,6 +138,20 @@ def init_db() -> None:
     
 
     )
+    # sessions table (for login sessions)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sessions(
+            id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+        """
+    )
+
 
     conn.commit()
     conn.close()
@@ -422,7 +437,143 @@ def get_user_by_email(email: str) -> Dict | None:
 
     return dict(row) if row else None
 
-from typing import List, Dict, Optional
+def get_user_by_id(user_id: int) -> Optional[Dict]:
+    """
+    Look up a user by numeric id. Returns dict or None.
+    """
+    conn = sqlite3.connect(database_path)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT id, email, password_hash, created_at
+        FROM users
+        WHERE id = ?
+        """,
+        (user_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+
+    return dict(row) if row else None
+
+# --- Session helpers ---------------------------------------------------------
+
+SESSION_TIMEOUT_MINUTES = 30  # inactivity timeout
+
+
+def create_session(user_id: int) -> str:
+    """
+    Create a new login session for the given user_id and return the session token.
+    """
+    token = secrets.token_urlsafe(32)  # random, URL-safe session id
+    now = datetime.utcnow()
+    expires = now + timedelta(minutes=SESSION_TIMEOUT_MINUTES)
+
+    conn = sqlite3.connect(database_path)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO sessions (id, user_id, created_at, last_seen_at, expires_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            token,
+            user_id,
+            now.isoformat(timespec="seconds"),
+            now.isoformat(timespec="seconds"),
+            expires.isoformat(timespec="seconds"),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    return token
+
+
+def delete_session(session_id: str) -> None:
+    """
+    Remove a session from the DB (logout).
+    """
+    if not session_id:
+        return
+
+    conn = sqlite3.connect(database_path)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_session(session_id: str) -> Optional[Dict]:
+    """
+    Look up a session by id.
+    - Returns None if it does not exist or has expired.
+    - If expired, it is removed from the DB.
+    """
+    if not session_id:
+        return None
+
+    conn = sqlite3.connect(database_path)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, user_id, created_at, last_seen_at, expires_at
+        FROM sessions
+        WHERE id = ?
+        """,
+        (session_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        return None
+
+    expires_at_str = row["expires_at"]
+    try:
+        expires_at = datetime.fromisoformat(expires_at_str)
+    except Exception:
+        # Corrupt date → treat as expired and clean up
+        delete_session(session_id)
+        return None
+
+    if expires_at < datetime.utcnow():
+        # Session is expired → delete and report None
+        delete_session(session_id)
+        return None
+
+    return dict(row)
+
+
+def touch_session(session_id: str) -> None:
+    """
+    Extend a session's expiry based on current time (sliding 30-minute window).
+    """
+    if not session_id:
+        return
+
+    now = datetime.utcnow()
+    new_expires = now + timedelta(minutes=SESSION_TIMEOUT_MINUTES)
+
+    conn = sqlite3.connect(database_path)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE sessions
+        SET last_seen_at = ?, expires_at = ?
+        WHERE id = ?
+        """,
+        (
+            now.isoformat(timespec="seconds"),
+            new_expires.isoformat(timespec="seconds"),
+            session_id,
+        ),
+    )
+    conn.commit()
+    conn.close()
 
 def get_subscriptions_for_email(email: str) -> List[Dict]:
     """Return all subscriptions for a given email."""

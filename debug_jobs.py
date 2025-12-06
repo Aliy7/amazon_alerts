@@ -23,3 +23,5 @@ except Exception as e:
     print("Error querying jobs table:", e)
 
 conn.close()
+
+
